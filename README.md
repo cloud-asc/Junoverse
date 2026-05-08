@@ -99,4 +99,4 @@ python3 junoverse.py -i router.conf -o output.xlsx --html map.html
 
 ## Credits
 
-Created with :heart: by [@nickvourd](https://x.com/nickvourd/)
+Created with :heart: by [@nickvourd](https://x.com/nickvourd/).
