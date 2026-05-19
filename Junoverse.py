@@ -22,7 +22,7 @@ def print_banner():
  ╚════╝  ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝
 
   Created with <3 by @nickvourd
-  v1.0
+  v1.1
 """
     print(banner)
 
@@ -84,37 +84,165 @@ def add_row(
     })
 
 
-def extract_named_block(content, name):
+# -------------------------------------------------------------------
+# v1.1 fix: find ALL '{name} { ... }' blocks anywhere in the config,
+# not just the first one. Real JUNOS configs from enterprise gear
+# routinely place an 'interfaces { ... }' template inside groups,
+# logical-systems and routing-instances BEFORE the top-level
+# 'interfaces { ... }' block. The old extract_named_block() locked
+# onto the first match and silently dropped every subsequent
+# interface in the file.
+# -------------------------------------------------------------------
+def find_all_named_blocks(content, name):
 
-    pattern = re.search(
+    results = []
+
+    for match in re.finditer(
         rf'\b{name}\s*\{{',
         content
+    ):
+
+        start = match.end()
+
+        depth = 1
+
+        i = start
+
+        while i < len(content):
+
+            ch = content[i]
+
+            if ch == "{":
+                depth += 1
+
+            elif ch == "}":
+
+                depth -= 1
+
+                if depth == 0:
+
+                    results.append(
+                        content[start:i]
+                    )
+
+                    break
+
+            i += 1
+
+    return results
+
+
+# kept for backward compatibility — returns the FIRST block only
+def extract_named_block(content, name):
+
+    blocks = find_all_named_blocks(
+        content,
+        name
     )
 
-    if not pattern:
-        return ""
+    return blocks[0] if blocks else ""
 
-    start = pattern.end()
 
-    depth = 1
+# -------------------------------------------------------------------
+# v1.1 fix: walk only the DIRECT children of a block, instead of
+# running re.finditer() across the whole text. The old code matched
+# every '<id> {' in the string, including ones nested deep inside,
+# which produced spurious "interfaces" like the literal '172' or
+# 'inet'. This walker is brace-aware and depth-aware, and also
+# tolerates 'inactive:' / 'protect:' / 'replace:' modifiers and
+# JUNOS comments.
+# -------------------------------------------------------------------
+def iter_top_level_blocks(body):
 
-    i = start
+    i = 0
+    n = len(body)
 
-    while i < len(content):
+    while i < n:
 
-        if content[i] == "{":
-            depth += 1
+        ch = body[i]
 
-        elif content[i] == "}":
+        # whitespace / statement terminators
+        if ch.isspace() or ch == ';':
+            i += 1
+            continue
 
-            depth -= 1
+        # # line comments
+        if ch == '#':
 
-            if depth == 0:
-                return content[start:i]
+            nl = body.find('\n', i)
 
-        i += 1
+            i = nl + 1 if nl != -1 else n
 
-    return ""
+            continue
+
+        # /* block comments */
+        if body[i:i + 2] == '/*':
+
+            end = body.find('*/', i + 2)
+
+            i = end + 2 if end != -1 else n
+
+            continue
+
+        # optional config modifier (inactive:, protect:, replace:)
+        mod = re.match(
+            r'(?:inactive|protect|replace):\s+',
+            body[i:]
+        )
+
+        if mod:
+            i += mod.end()
+            continue
+
+        # try to match '<name> [optional-arg] {'
+        header = re.match(
+            r'([A-Za-z0-9_\-/.:*@]+)([^\n{;]*?)\{',
+            body[i:]
+        )
+
+        if not header:
+
+            # not a block — skip to the next ';' or newline
+            nxt = re.search(r'[;\n]', body[i:])
+
+            if not nxt:
+                break
+
+            i += nxt.end()
+
+            continue
+
+        name = header.group(1)
+        arg = header.group(2).strip()
+
+        # locate the matching '}'
+        start = i + header.end()
+
+        depth = 1
+        j = start
+
+        while j < n:
+
+            cj = body[j]
+
+            if cj == '{':
+                depth += 1
+
+            elif cj == '}':
+
+                depth -= 1
+
+                if depth == 0:
+                    break
+
+            j += 1
+
+        if depth != 0:
+            break
+
+        yield name, arg, body[start:j]
+
+        i = j + 1
 
 
 def parse_set_format(content, hostname):
@@ -134,9 +262,9 @@ def parse_set_format(content, hostname):
             (interface, unit)
         ] = clean(desc)
 
-    # Parse interface addresses
+    # Parse interface addresses (inet and inet6)
     for match in re.finditer(
-        r'^set\s+interfaces\s+(\S+)\s+unit\s+(\S+).*?\bfamily\s+inet\s+address\s+([0-9a-fA-F:.]+/\d+)',
+        r'^set\s+interfaces\s+(\S+)\s+unit\s+(\S+).*?\bfamily\s+inet6?\s+address\s+([0-9a-fA-F:.]+/\d+)',
         content,
         re.MULTILINE
     ):
@@ -168,119 +296,81 @@ def parse_hierarchical_interfaces(
     hostname
 ):
 
-    interfaces_block = extract_named_block(
+    # v1.1: iterate over EVERY interfaces { ... } block in the file,
+    # including ones nested inside groups, logical-systems and
+    # routing-instances. The old version only saw the first one.
+    interfaces_blocks = find_all_named_blocks(
         content,
         "interfaces"
     )
 
-    if not interfaces_block:
+    if not interfaces_blocks:
         return
 
-    interface_matches = re.finditer(
-        r'([A-Za-z0-9\-/.:]+)\s*\{',
-        interfaces_block
-    )
+    for interfaces_block in interfaces_blocks:
 
-    for interface_match in interface_matches:
+        # walk only the direct children
+        for if_name, if_arg, interface_block in (
+            iter_top_level_blocks(interfaces_block)
+        ):
 
-        interface = interface_match.group(1)
+            # interface-range FOO { ... } — treat FOO as the iface
+            if if_name == "interface-range" and if_arg:
+                interface = if_arg
 
-        start = interface_match.end()
-
-        depth = 1
-
-        i = start
-
-        while i < len(interfaces_block):
-
-            if interfaces_block[i] == "{":
-                depth += 1
-
-            elif interfaces_block[i] == "}":
-
-                depth -= 1
-
-                if depth == 0:
-                    interface_block = (
-                        interfaces_block[start:i]
-                    )
-                    break
-
-            i += 1
-
-        else:
-            continue
-
-        unit_matches = re.finditer(
-            r'\b(?:inactive:\s*)?unit\s+([^\s{]+)\s*\{',
-            interface_block
-        )
-
-        for unit_match in unit_matches:
-
-            unit = unit_match.group(1)
-
-            unit_start = unit_match.end()
-
-            depth = 1
-
-            j = unit_start
-
-            while j < len(interface_block):
-
-                if interface_block[j] == "{":
-                    depth += 1
-
-                elif interface_block[j] == "}":
-
-                    depth -= 1
-
-                    if depth == 0:
-                        unit_block = (
-                            interface_block[
-                                unit_start:j
-                            ]
-                        )
-                        break
-
-                j += 1
-
-            else:
+            elif if_name in (
+                "traceoptions",
+                "apply-groups",
+                "apply-macro"
+            ):
                 continue
 
-            desc_match = re.search(
-                r'\bdescription\s+("[^"]+"|[^;\n]+);',
-                unit_block
-            )
+            else:
+                interface = if_name
 
-            subnet_name = (
-                clean(desc_match.group(1))
-                if desc_match
-                else f"{interface}.{unit}"
-            )
+            # walk units (and inactive units) inside this interface
+            for sub_name, sub_arg, unit_block in (
+                iter_top_level_blocks(interface_block)
+            ):
 
-            addresses = re.findall(
-                r'\baddress\s+([0-9a-fA-F:.]+/\d+)',
-                unit_block
-            )
+                if sub_name != "unit":
+                    continue
 
-            for ip_address in addresses:
+                unit = sub_arg
 
-                subnet = cidr_from_ip(
-                    ip_address
+                desc_match = re.search(
+                    r'\bdescription\s+("[^"]+"|[^;\n]+);',
+                    unit_block
                 )
 
-                if subnet:
+                subnet_name = (
+                    clean(desc_match.group(1))
+                    if desc_match
+                    else f"{interface}.{unit}"
+                )
 
-                    add_row(
-                        hostname,
-                        "interfaces",
-                        interface,
-                        unit,
-                        subnet_name,
-                        ip_address,
-                        subnet
+                addresses = re.findall(
+                    r'\baddress\s+([0-9a-fA-F:.]+/\d+)',
+                    unit_block
+                )
+
+                for ip_address in addresses:
+
+                    subnet = cidr_from_ip(
+                        ip_address
                     )
+
+                    if subnet:
+
+                        add_row(
+                            hostname,
+                            "interfaces",
+                            interface,
+                            unit,
+                            subnet_name,
+                            ip_address,
+                            subnet
+                        )
 
 
 def parse_address_assignment_pools(
@@ -288,67 +378,65 @@ def parse_address_assignment_pools(
     hostname
 ):
 
-    access_block = extract_named_block(
+    # v1.1: scan every 'access { ... }' block, not just the first
+    access_blocks = find_all_named_blocks(
         content,
         "access"
     )
 
-    if not access_block:
-        return
+    for access_block in access_blocks:
 
-    pool_matches = re.finditer(
-        r'\b(?:inactive:\s*)?pool\s+([^\s{]+)\s*\{',
-        access_block
-    )
+        for name, arg, body in (
+            iter_top_level_blocks(access_block)
+        ):
 
-    for pool_match in pool_matches:
-
-        pool_name = clean(
-            pool_match.group(1)
-        )
-
-        start = pool_match.end()
-
-        depth = 1
-
-        i = start
-
-        while i < len(access_block):
-
-            if access_block[i] == "{":
-                depth += 1
-
-            elif access_block[i] == "}":
-
-                depth -= 1
-
-                if depth == 0:
-                    pool_block = (
-                        access_block[start:i]
+            if name != "address-assignment":
+                # the old config also allowed 'pool' directly under
+                # 'access' on some platforms — keep that path open
+                if name == "pool" and arg:
+                    pool_name = clean(arg)
+                    networks = re.findall(
+                        r'\bnetwork\s+([0-9a-fA-F:.]+/\d+);',
+                        body
                     )
-                    break
+                    for subnet in networks:
+                        add_row(
+                            hostname,
+                            "dhcp-pool",
+                            "",
+                            "",
+                            pool_name,
+                            "",
+                            subnet
+                        )
+                continue
 
-            i += 1
+            # walk pools inside address-assignment
+            for sub_name, sub_arg, pool_body in (
+                iter_top_level_blocks(body)
+            ):
 
-        else:
-            continue
+                if sub_name != "pool":
+                    continue
 
-        networks = re.findall(
-            r'\bnetwork\s+([0-9a-fA-F:.]+/\d+);',
-            pool_block
-        )
+                pool_name = clean(sub_arg)
 
-        for subnet in networks:
+                networks = re.findall(
+                    r'\bnetwork\s+([0-9a-fA-F:.]+/\d+);',
+                    pool_body
+                )
 
-            add_row(
-                hostname,
-                "dhcp-pool",
-                "",
-                "",
-                pool_name,
-                "",
-                subnet
-            )
+                for subnet in networks:
+
+                    add_row(
+                        hostname,
+                        "dhcp-pool",
+                        "",
+                        "",
+                        pool_name,
+                        "",
+                        subnet
+                    )
 
 
 def parse_junos_file(file_path):
