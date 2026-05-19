@@ -9,7 +9,7 @@ A simple Python parser for Junos configuration files that extracts subnet inform
 
 Junoverse is a Python-based network segmentation discovery and visualization tool designed for parsing JUNOS configuration files and exporting:
 
-Version: `1.0`
+Version: `1.1`
 
 - 📊 Excel subnet reports
 - 🗺️ Interactive HTML network segmentation maps
